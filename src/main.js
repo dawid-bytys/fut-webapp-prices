@@ -2,7 +2,7 @@
 // @name         FC Web App Prices
 // @namespace    http://tampermonkey.net/
 // @version      1.1
-// @description  Display fut.gg prices with priority refresh
+// @description  Display fut.gg prices
 // @author       You
 // @match        https://www.ea.com/ea-sports-fc/ultimate-team/web-app/*
 // @grant        GM_xmlhttpRequest
@@ -12,6 +12,7 @@
 
 const CONFIG = {
   CACHE_DURATION: 2 * 60 * 1000,
+  STALE_DURATION: 5 * 60 * 1000,
   MIN_PROFIT: 10000,
   EA_TAX: 0.05,
   QUEUE_INTERVAL: 300,
@@ -65,94 +66,6 @@ const SELECTORS = {
   PAGING: '.pagingContainer, .ut-paging-control',
   LIST_ITEM: 'li.listFUTItem',
 };
-
-class PriorityTracker {
-  constructor() {
-    this.viewCounts = new Map();
-    this.lastViewed = new Map();
-    this.loadFromStorage();
-  }
-
-  loadFromStorage() {
-    try {
-      const stored = localStorage.getItem('futgg_priority_tracker');
-      if (!stored) {
-        return;
-      }
-
-      const parsed = JSON.parse(stored);
-
-      if (parsed.viewCounts) {
-        this.viewCounts = new Map(Object.entries(parsed.viewCounts));
-      }
-
-      if (parsed.lastViewed) {
-        this.lastViewed = new Map(Object.entries(parsed.lastViewed));
-      }
-    } catch (error) {
-      console.error('Failed to load priority tracker:', error);
-    }
-  }
-
-  saveToStorage() {
-    try {
-      const data = {
-        viewCounts: Object.fromEntries(this.viewCounts),
-        lastViewed: Object.fromEntries(this.lastViewed),
-      };
-      localStorage.setItem('futgg_priority_tracker', JSON.stringify(data));
-    } catch (error) {
-      console.error('Failed to save priority tracker:', error);
-    }
-  }
-
-  recordView(definitionId) {
-    const currentCount = this.viewCounts.get(definitionId) || 0;
-    this.viewCounts.set(definitionId, currentCount + 1);
-    this.lastViewed.set(definitionId, Date.now());
-    this.saveToStorage();
-  }
-
-  recordBatchViews(definitionIds) {
-    const uniqueIds = new Set(definitionIds);
-
-    for (const id of uniqueIds) {
-      const currentCount = this.viewCounts.get(id) || 0;
-      this.viewCounts.set(id, currentCount + 1);
-      this.lastViewed.set(id, Date.now());
-    }
-
-    this.saveToStorage();
-  }
-
-  getViewCount(definitionId) {
-    return this.viewCounts.get(definitionId) || 0;
-  }
-
-  getLastViewed(definitionId) {
-    return this.lastViewed.get(definitionId) || 0;
-  }
-
-  calculatePriority(definitionId) {
-    const viewCount = this.getViewCount(definitionId);
-    const lastViewed = this.getLastViewed(definitionId);
-    const now = Date.now();
-
-    const timeSinceView = now - lastViewed;
-    const hoursSinceView = timeSinceView / (1000 * 60 * 60);
-
-    const viewScore = Math.log(viewCount + 1) * 10;
-    const recencyScore = Math.max(0, 10 - hoursSinceView);
-
-    return viewScore + recencyScore;
-  }
-
-  getPrioritizedList(definitionIds) {
-    return [...definitionIds].sort((a, b) => {
-      return this.calculatePriority(b) - this.calculatePriority(a);
-    });
-  }
-}
 
 class CacheManager {
   constructor() {
@@ -236,6 +149,16 @@ class CacheManager {
 
   hasDetailedPrice(definitionId) {
     return this.detailedCache.has(definitionId);
+  }
+
+  isStale(definitionId) {
+    const cached = this.detailedCache.get(definitionId);
+    if (!cached) {
+      return true;
+    }
+
+    const now = Date.now();
+    return now - cached.timestamp >= CONFIG.STALE_DURATION;
   }
 
   getAllDetailedIds() {
@@ -494,7 +417,7 @@ class ModalBuilder {
                       <h2>Player Price Details</h2>
                       <button class="futgg-modal-close">×</button>
                   </div>
-
+  
                   <div class="futgg-modal-section">
                       <h3>Current Price Info</h3>
                       ${
@@ -543,7 +466,7 @@ class ModalBuilder {
                           <span class="futgg-stat-value">${Formatter.formatPrice(data.priceRange.minPrice)} - ${Formatter.formatPrice(data.priceRange.maxPrice)}</span>
                       </div>
                   </div>
-
+  
                   ${this.buildCompletedAuctionsSection(data.completedAuctions)}
                   ${this.buildLiveAuctionsSection(data.liveAuctions)}
               </div>
@@ -896,12 +819,11 @@ class FilterManager {
 }
 
 class PriceOverlayManager {
-  constructor(cacheManager, overlayRegistry, apiClient, fetchQueue, priorityTracker) {
+  constructor(cacheManager, overlayRegistry, apiClient, fetchQueue) {
     this.cache = cacheManager;
     this.registry = overlayRegistry;
     this.api = apiClient;
     this.queue = fetchQueue;
-    this.priorityTracker = priorityTracker;
   }
 
   async fetchAndCachePrices(definitionIds) {
@@ -964,7 +886,6 @@ class PriceOverlayManager {
       event.preventDefault();
 
       this.queue.remove(definitionId);
-      this.priorityTracker.recordView(definitionId);
 
       const loadingOverlay = document.createElement('div');
       loadingOverlay.className = 'futgg-modal-overlay';
@@ -1061,6 +982,7 @@ class PriceOverlayManager {
     this.registry.pruneDisconnected(definitionId);
 
     const overlays = this.registry.getOverlays(definitionId);
+
     if (!overlays) {
       return;
     }
@@ -1153,73 +1075,12 @@ class QueueProcessor {
   }
 }
 
-class BackgroundRefresher {
-  constructor(cacheManager, fetchQueue, detailedPriceUpdater, priorityTracker) {
-    this.cache = cacheManager;
-    this.queue = fetchQueue;
-    this.updater = detailedPriceUpdater;
-    this.priorityTracker = priorityTracker;
-    this.currentIndex = 0;
-    this.prioritizedList = [];
-    this.lastRefreshCycle = Date.now();
-    this.refreshCycleInterval = 5 * 60 * 1000;
-  }
-
-  updatePrioritizedList() {
-    const allCachedIds = this.cache.getAllDetailedIds();
-    this.prioritizedList = this.priorityTracker.getPrioritizedList(allCachedIds);
-    this.currentIndex = 0;
-  }
-
-  shouldUpdatePriorities() {
-    const now = Date.now();
-    return now - this.lastRefreshCycle >= this.refreshCycleInterval;
-  }
-
-  start() {
-    setInterval(async () => {
-      if (this.queue.length > 0 || this.queue.busy) {
-        return;
-      }
-
-      if (this.shouldUpdatePriorities() || this.prioritizedList.length === 0) {
-        this.updatePrioritizedList();
-        this.lastRefreshCycle = Date.now();
-      }
-
-      if (this.prioritizedList.length === 0) {
-        return;
-      }
-
-      if (this.currentIndex >= this.prioritizedList.length) {
-        this.updatePrioritizedList();
-      }
-
-      const definitionId = this.prioritizedList[this.currentIndex];
-      const priority = this.priorityTracker.calculatePriority(definitionId);
-      const viewCount = this.priorityTracker.getViewCount(definitionId);
-
-      this.currentIndex++;
-      this.queue.busy = true;
-
-      try {
-        await this.updater.update(definitionId);
-      } catch (error) {
-        console.error('Background refresh failed:', error);
-      } finally {
-        this.queue.busy = false;
-      }
-    }, CONFIG.QUEUE_INTERVAL);
-  }
-}
-
 class ListProcessor {
-  constructor(overlayManager, fetchQueue, queueProcessor, cacheManager, priorityTracker) {
+  constructor(overlayManager, fetchQueue, queueProcessor, cacheManager) {
     this.overlayManager = overlayManager;
     this.queue = fetchQueue;
     this.queueProcessor = queueProcessor;
     this.cache = cacheManager;
-    this.priorityTracker = priorityTracker;
     this.isProcessing = false;
   }
 
@@ -1237,9 +1098,6 @@ class ListProcessor {
 
     try {
       const definitionIds = validItems.map(li => DomHelper.getDefinitionId(li)).filter(Boolean);
-
-      this.priorityTracker.recordBatchViews(definitionIds);
-
       const priceData = await this.overlayManager.fetchAndCachePrices(definitionIds);
 
       for (const li of validItems) {
@@ -1247,7 +1105,7 @@ class ListProcessor {
       }
 
       DomHelper.unhidePaging();
-      this.enqueueNewFetches(definitionIds);
+      this.enqueueStaleItems(definitionIds);
       this.queueProcessor.start();
     } finally {
       this.isProcessing = false;
@@ -1268,13 +1126,20 @@ class ListProcessor {
     return validItems;
   }
 
-  enqueueNewFetches(definitionIds) {
+  enqueueStaleItems(definitionIds) {
     const uniqueIds = [...new Set(definitionIds)];
 
     for (const definitionId of uniqueIds) {
       if (this.cache.hasDetailedPrice(definitionId)) {
+        // Show stale data immediately
         this.overlayManager.updateOverlays(definitionId);
+
+        // Enqueue for refresh if stale
+        if (this.cache.isStale(definitionId)) {
+          this.queue.enqueue(definitionId);
+        }
       } else {
+        // No cached data, enqueue for fetch
         this.queue.enqueue(definitionId);
       }
     }
@@ -1348,14 +1213,12 @@ class Application {
     this.apiClient = new ApiClient();
     this.fetchQueue = new FetchQueue();
     this.filterManager = new FilterManager();
-    this.priorityTracker = new PriorityTracker();
 
     this.overlayManager = new PriceOverlayManager(
       this.cache,
       this.overlayRegistry,
       this.apiClient,
       this.fetchQueue,
-      this.priorityTracker,
     );
 
     this.detailedPriceUpdater = new DetailedPriceUpdater(
@@ -1366,19 +1229,11 @@ class Application {
 
     this.queueProcessor = new QueueProcessor(this.fetchQueue, this.detailedPriceUpdater);
 
-    this.backgroundRefresher = new BackgroundRefresher(
-      this.cache,
-      this.fetchQueue,
-      this.detailedPriceUpdater,
-      this.priorityTracker,
-    );
-
     this.listProcessor = new ListProcessor(
       this.overlayManager,
       this.fetchQueue,
       this.queueProcessor,
       this.cache,
-      this.priorityTracker,
     );
 
     this.listObserver = new ListObserver(this.listProcessor);
@@ -1389,7 +1244,6 @@ class Application {
     StyleInjector.inject();
     this.listObserver.start();
     this.queueProcessor.start();
-    this.backgroundRefresher.start();
     this.filterManager.start();
     this.pageObserver.start();
   }
